@@ -3,10 +3,10 @@ name: Compile TS to QM
 on:
   push:
     paths:
-      - 'opensnitch/ui/i18n/locales/zh_Hans/opensnitch-zh_Hans.ts'
+      - 'ui/i18n/locales/zh_Hans/opensnitch-zh_Hans.ts'
   pull_request:
     paths:
-      - 'opensnitch/ui/i18n/locales/zh_Hans/opensnitch-zh_Hans.ts'
+      - 'ui/i18n/locales/zh_Hans/opensnitch-zh_Hans.ts'
   workflow_dispatch:  # 允许手动触发
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
     
     - name: Compile TS to QM
       run: |
-        lrelease opensnitch/ui/i18n/locales/zh_Hans/opensnitch-zh_Hans.ts -qm ./compiled_translations/opensnitch-zh_Hans.qm
+        lrelease ui/i18n/locales/zh_Hans/opensnitch-zh_Hans.ts -qm ./compiled_translations/opensnitch-zh_Hans.qm
     
     - name: Upload QM file as artifact
       uses: actions/upload-artifact@v4
