@@ -1,0 +1,327 @@
+# Build RPM packages for OpenSnitch
+#
+# Builds two RPMs in a Fedora container:
+#   - opensnitch        (Go daemon + systemd service + eBPF modules)
+#   - opensnitch-ui     (Python Qt6 GUI, noarch)
+#
+# Artifacts are uploaded per Fedora release.
+
+name: Build RPM packages
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      fedora_release:
+        description: Fedora release(s) to build for (space-separated)
+        required: true
+        default: '40 41'
+
+jobs:
+  rpm:
+    name: RPM (Fedora ${{ matrix.release }})
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:${{ matrix.release }}
+
+    strategy:
+      matrix:
+        release: ${{ fromJSON(format('[{}]', inputs.fedora_release || '40')) }}
+      fail-fast: false
+
+    steps:
+      # ----------------------------------------------------------------
+      # Step 1 – checkout
+      # ----------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------
+      # Step 2 – install all build dependencies
+      # ----------------------------------------------------------------
+      - name: Install system build dependencies
+        run: |
+          dnf install -y dnf-plugins-core rpmdevtools rpm-build \
+            git make findutils file sed \
+            golang protobuf-compiler protobuf-devel \
+            libnetfilter_queue-devel libmnl-devel libpcap-devel \
+            systemd-devel desktop-file-utils libappstream-glib \
+            python3 python3-devel python3-setuptools python3-pip \
+            pyqt6-dev-tools python3-pyqt6 \
+            python3-grpcio-tools python3-grpcio python3-protobuf \
+            python3-slugify python3-inotify python3-packaging \
+            python3-pyasn1-modules \
+            clang llvm elfutils-libelf-devel bc || true
+
+      # ----------------------------------------------------------------
+      # Step 3 – build protobuf stubs
+      # ----------------------------------------------------------------
+      - name: Install protoc Go plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.1
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build protobuf stubs
+        run: |
+          cd proto && make all
+
+      # ----------------------------------------------------------------
+      # Step 4 – build the Go daemon binary
+      # ----------------------------------------------------------------
+      - name: Build opensnitch daemon
+        run: |
+          cd daemon
+          go mod tidy
+          go build -v -ldflags="-s -w" -o opensnitchd .
+
+      # ----------------------------------------------------------------
+      # Step 5 – (optional) build eBPF modules
+      # ----------------------------------------------------------------
+      - name: Build eBPF modules
+        continue-on-error: true
+        run: |
+          if [ -f ebpf_prog/Makefile ] && command -v clang &>/dev/null; then
+            cd ebpf_prog && make
+            echo "ebpf_built=true" >> "$GITHUB_ENV"
+          else
+            echo "ebpf_built=false" >> "$GITHUB_ENV"
+          fi
+
+      # ----------------------------------------------------------------
+      # Step 6 – build UI resources
+      # ----------------------------------------------------------------
+      - name: Build UI resources
+        run: |
+          cd ui
+          make -C i18n
+          python3 setup.py build
+
+      # ----------------------------------------------------------------
+      # Step 7 – prepare RPM build tree & extract version
+      # ----------------------------------------------------------------
+      - name: Setup RPM build tree
+        run: |
+          rpmdev-setuptree
+          VERSION=$(grep 'Version' daemon/core/version.go | sed 's/.*"\(.*\)"/\1/')
+          echo "PKG_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building OpenSnitch version: $VERSION"
+
+      # ----------------------------------------------------------------
+      # Step 8 – write daemon RPM spec
+      # ----------------------------------------------------------------
+      - name: Write daemon RPM spec
+        run: |
+          mkdir -p packaging
+          VERSION=$PKG_VERSION
+
+          cat > packaging/opensnitch.spec <<SPECEOF
+%global debug_package %{nil}
+
+Name:           opensnitch
+Version:        ${VERSION}
+Release:        1%{?dist}
+Summary:        GNU/Linux interactive application firewall
+
+License:        GPL-3.0-or-later
+URL:            https://github.com/evilsocket/opensnitch
+Source0:        opensnitch-%{version}.tar.gz
+BuildRequires:  systemd-rpm-macros
+Requires(post):   systemd
+Requires(preun):  systemd
+Requires(postun): systemd
+
+%description
+Whenever a program makes a connection, OpenSnitch prompts the user
+to allow or deny it. Rules can be based on port, UID, dst IP,
+program, or a combination of them.
+
+%prep
+%setup -q -n opensnitch-%{version}
+
+%build
+echo "binaries pre-built by CI steps"
+
+%install
+mkdir -p %{buildroot}%{_bindir}
+mkdir -p %{buildroot}%{_unitdir}
+mkdir -p %{buildroot}%{_sysconfdir}/opensnitchd/rules
+mkdir -p %{buildroot}%{_sysconfdir}/opensnitchd/tasks
+mkdir -p %{buildroot}%{_prefix}/lib/opensnitchd/ebpf
+mkdir -p %{buildroot}%{_sysconfdir}/logrotate.d
+
+install -m 755 daemon/opensnitchd %{buildroot}%{_bindir}/opensnitchd
+
+sed 's|/usr/local/bin/|/usr/bin/|' daemon/data/init/opensnitchd.service \
+  > %{buildroot}%{_unitdir}/opensnitch.service
+
+install -m 644 daemon/data/default-config.json  %{buildroot}%{_sysconfdir}/opensnitchd/
+install -m 644 daemon/data/system-fw.json       %{buildroot}%{_sysconfdir}/opensnitchd/
+install -m 644 daemon/data/network_aliases.json  %{buildroot}%{_sysconfdir}/opensnitchd/ 2>/dev/null || install -m 644 daemon/data/network_aliases.json  %{buildroot}%{_sysconfdir}/opensnitchd/
+install -m 600 daemon/data/rules/*.json          %{buildroot}%{_sysconfdir}/opensnitchd/rules/
+install -m 600 daemon/data/tasks/tasks.json      %{buildroot}%{_sysconfdir}/opensnitchd/tasks/
+
+if [ -f ebpf_prog/opensnitch.o ]; then
+  install -m 644 ebpf_prog/opensnitch.o       %{buildroot}%{_prefix}/lib/opensnitchd/ebpf/
+  install -m 644 ebpf_prog/opensnitch-dns.o   %{buildroot}%{_prefix}/lib/opensnitchd/ebpf/
+  install -m 644 ebpf_prog/opensnitch-procs.o %{buildroot}%{_prefix}/lib/opensnitchd/ebpf/
+fi
+
+if [ -f utils/packaging/daemon/deb/debian/opensnitch.logrotate ]; then
+  install -m 644 utils/packaging/daemon/deb/debian/opensnitch.logrotate \
+    %{buildroot}%{_sysconfdir}/logrotate.d/opensnitch
+fi
+
+%post
+%systemd_post opensnitch.service
+
+%preun
+%systemd_preun opensnitch.service
+
+%postun
+%systemd_postun_with_restart opensnitch.service
+
+%files
+%license LICENSE
+%doc README.md
+%config(noreplace) %{_sysconfdir}/opensnitchd/*
+%{_bindir}/opensnitchd
+%{_unitdir}/opensnitch.service
+%{_prefix}/lib/opensnitchd/ebpf/*.o
+%config(noreplace) %{_sysconfdir}/logrotate.d/opensnitch
+
+%changelog
+* $(date "+%a %b %d %Y") OpenSnitch CI <ci@opensnitch.dev>
+- Automated build for version ${VERSION}
+SPECEOF
+
+      # ----------------------------------------------------------------
+      # Step 9 – write UI RPM spec
+      # ----------------------------------------------------------------
+      - name: Write UI RPM spec
+        run: |
+          VERSION=$PKG_VERSION
+
+          cat > packaging/opensnitch-ui.spec <<SPECEOF
+%global __python python3
+%global _binary_payload w9.gzdio
+%global _python_bytecompile_extra 0
+
+Name:           opensnitch-ui
+Version:        ${VERSION}
+Release:        1%{?dist}
+Summary:        Qt6 GUI for the OpenSnitch application firewall
+
+License:        GPL-3.0-or-later
+URL:            https://github.com/evilsocket/opensnitch
+Source0:        opensnitch-%{version}.tar.gz
+BuildArch:      noarch
+
+BuildRequires:  python3-devel python3-setuptools python3-pip
+BuildRequires:  pyqt6-dev-tools python3-pyqt6
+BuildRequires:  python3-grpcio-tools python3-protobuf
+BuildRequires:  desktop-file-utils libappstream-glib
+
+Requires:       python3
+Requires:       python3-pyqt6
+Requires:       python3-grpcio
+Requires:       python3-protobuf
+Requires:       python3-slugify
+Requires:       python3-inotify
+Requires:       python3-packaging
+Requires:       python3-notify2
+Requires:       libqt6sql6-sqlite
+Requires:       opensnitch = %{version}-%{release}
+
+%description
+Qt6 GUI for opensnitch. Browse live connections, search by process, user,
+host or port. Create persistent, session, or one-time allow/deny rules.
+
+%prep
+%setup -q -n opensnitch-%{version}
+
+%build
+cd ui
+make -C i18n
+python3 setup.py build
+
+%install
+cd ui
+python3 setup.py install \
+  --install-lib=%{python3_sitelib} \
+  --single-version-externally-managed \
+  -O1 --root=%{buildroot} --prefix=%{_prefix} \
+  --record=INSTALLED_FILES \
+  --install-scripts=%{_bindir}
+
+find %{buildroot}%{python3_sitelib}/opensnitch/proto/ \
+  -name 'ui_pb2_grpc.py' \
+  -exec sed -i 's/^import ui_pb2/from . import ui_pb2/' {} \;
+
+desktop-file-validate %{buildroot}%{_datadir}/applications/opensnitch_ui.desktop || true
+appstreamcli validate %{buildroot}%{_metainfodir}/io.github.evilsocket.opensnitch.appdata.xml || true
+
+%post
+if [ \$1 -ge 1 ] && [ -d /etc/xdg/autostart ]; then
+  ln -sf %{_datadir}/applications/opensnitch_ui.desktop \
+    /etc/xdg/autostart/opensnitch_ui.desktop
+fi
+gtk-update-icon-cache %{_datadir}/icons/hicolor/ 2>/dev/null || :
+
+%postun
+if [ \$1 -eq 0 ]; then
+  rm -f /etc/xdg/autostart/opensnitch_ui.desktop
+  pkill -15 opensnitch-ui 2>/dev/null || :
+fi
+
+%files -f ui/INSTALLED_FILES
+%license LICENSE
+%doc README.md
+
+%changelog
+* $(date "+%a %b %d %Y") OpenSnitch CI <ci@opensnitch.dev>
+- Automated build for version ${VERSION}
+SPECEOF
+
+      # ----------------------------------------------------------------
+      # Step 10 – create source tarball
+      # ----------------------------------------------------------------
+      - name: Create source tarball
+        run: |
+          cd ..
+          tar czf ~/rpmbuild/SOURCES/opensnitch-$PKG_VERSION.tar.gz \
+            --transform "s|^opensnitch|opensnitch-$PKG_VERSION|" \
+            --exclude=.git \
+            --exclude='daemon/opensnitchd' \
+            --exclude='__pycache__' \
+            opensnitch
+
+      # ----------------------------------------------------------------
+      # Step 11 – build RPMs
+      # ----------------------------------------------------------------
+      - name: Build daemon RPM
+        run: |
+          rpmbuild -ba packaging/opensnitch.spec \
+            --define "_sourcedir $HOME/rpmbuild/SOURCES"
+
+      - name: Build UI RPM
+        run: |
+          rpmbuild -ba packaging/opensnitch-ui.spec \
+            --define "_sourcedir $HOME/rpmbuild/SOURCES"
+
+      # ----------------------------------------------------------------
+      # Step 12 – upload artifacts
+      # ----------------------------------------------------------------
+      - name: List built RPMs
+        run: find ~/rpmbuild/RPMS -name '*.rpm' -type f | sort
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensnitch-rpms-f${{ matrix.release }}
+          path: ~/rpmbuild/RPMS/**/*.rpm
+          retention-days: 14
