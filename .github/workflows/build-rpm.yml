@@ -13,11 +13,6 @@ on:
   pull_request:
     branches: [master, main]
   workflow_dispatch:
-    inputs:
-      fedora_release:
-        description: Fedora release(s) to build for
-        required: true
-        default: '40 41'
 
 jobs:
   rpm:
@@ -28,7 +23,7 @@ jobs:
 
     strategy:
       matrix:
-        release: ${{ fromJSON(format('[{}]', inputs.fedora_release || '40')) }}
+        release: [40, 41]
       fail-fast: false
 
     steps:
